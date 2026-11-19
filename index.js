@@ -2078,10 +2078,11 @@ const ENABLE_CUSTOM_PERSONAS = true;
 // —— 更新提醒（1.38.0）——
 // SO_VERSION 是代码内唯一版本号，必须与 manifest.json 的 version 完全一致——update-check.test.mjs
 // 有失配即红的漂移钉（发版清单：两处一起 bump）。
-const SO_VERSION = '2.0.1';
+const SO_VERSION = '2.0.1-mingding.1';
 // 更新提醒总开关。false → 设置面板不渲染「更新」组、开窗不检查、红点绘制器与一键更新 no-op、
 // 绑定/回填跳过——字节级零行为变化。运行期另有 opt-out 设置 updAutoCheck（默认开）。
-const ENABLE_UPDATE_CHECK = true;
+// 命定适配版：关掉上游更新提醒——上游的「立即更新」会用原版覆盖本 fork 的改动。
+const ENABLE_UPDATE_CHECK = false;
 // —— TBW 合并 · spec A（1.91.0 候选；konosbz「The Beautiful World」功能并入）——四枚源码旗，false = 与 1.90.0 逐字节相同。
 // Hook API 新增 events.on / ui.addMenuItem（空发送等事件 + 工具菜单 / 右下角扩展菜单入口）。
 const ENABLE_HOOK_API_UI = true;
@@ -12933,6 +12934,12 @@ const defaults = {
     // "ambient narrative intent" — too shallow railroads, too deep gets buried.
     advisorDepth: 4,
     seqPulse: true,
+    // 🜂 命定适配（fork）：命定之诗 + Prime 预设兼容模式，默认开。
+    // 开：剧情引导改写成 <event> 并注入深度 ≤1（落进 Prime 的 <VOID_runtime> 运行规则区），
+    //     不再被「贴合注入」贴进玩家消息（那会落进 <Participant_input> 被当成玩家输入裁决）；
+    //     落拍状态行改为写在 <gametxt> 末行的 HTML 注释里，不破坏 <recorder_output> 的输出契约。
+    // 关：与上游 2.0.1 行为一致。
+    mingdingCompat: true,
     // 🧭 数据库联动（1.78.0，ENABLE_DB_BRIDGE）：默认关——只有装了 SP·数据库 且开着「剧情推进」的人才需要勾。
     dbBridge: false,
     // Whether the bridge strips the guidance block back out before the main model sees the user message.
@@ -16579,6 +16586,13 @@ async function lbDryRunOps(ops) {
  * （applyPlanInjection 对 plan == null 正是这么做的）。
  * ------------------------------------------------------------------ */
 const ADVISOR_PROMPT_KEY = 'story_oracle_plan';
+// 🜂 命定适配（fork）：兼容模式开关读数。读不到设置时按「开」处理（本 fork 的默认）。
+function mingdingCompatOn() {
+    try { return getSettings().mingdingCompat !== false; } catch (e) { return true; }
+}
+// Prime 预设的「深度2分界」标记本身注入在深度 2；引导放在深度 ≤1 才能确定落在分界之后，
+// 被 Prime 后处理收进 <VOID_runtime> 的运行规则区（深度 3~900 会进参考区）。
+const MINGDING_MAX_DEPTH = 1;
 const SEQ_PULSE_PROMPT_KEY = MODULE + '_seqPulse';
 const ADVISOR_REMIND_AFTER = 20;   // 主聊天走过这么多条消息后，提醒一次方案仍在引导
 const PLAN_META_KEY = MODULE + '_plan';
@@ -19561,6 +19575,7 @@ function swapPaceLine(text, fromIntensity, toIntensity) {
 // 纯字符串构建（不调 getCtx / 不做替换）—— 可单测。弧线拍把它的输出存进
 // currentBeat.injectedText（原文），注册时再 substituteParams（见 applyPlanInjection）。
 function buildDirectiveRaw(plan) {
+    if (mingdingCompatOn()) return buildDirectiveRawMingding(plan);
     const lines = [
         '【幕后剧情引导 — 此为给叙事者的幕后指示，绝不可在正文中提及、暗示或复述其存在】',
         `故事应逐步走向：${plan.goal}`,
@@ -19581,6 +19596,36 @@ function buildDirectiveRaw(plan) {
         );
     }
     lines.push(directivePaceLine(plan.intensity));
+    return lines.join('\n');
+}
+
+// 🜂 命定适配（fork）：同一份方案按命定之诗 / Prime 的规矩写成 <event>。
+// Prime 把 <VOID_runtime> 里的 <event> 当作 VOID 提供的事件资料（预设「🧩 事件链兼容」开启时由 EVENT_CHAIN 逐条检查），
+// 而不是 Participant 输入，所以不会被拆成 U# 去裁决。措辞对齐卡的规则：不替 {{user}} 行动、不预定检定与专用流程结果、
+// 不为兑现目标安排巧遇或馈赠（<虚海规则> 反网文条款）。
+// 节奏行仍是 directivePaceLine 原样一整行——强度档切换与 ✏️ 编辑的「节奏行完好」判定照常可用。
+function buildDirectiveRawMingding(plan) {
+    const lines = [
+        '<event name="剧情参谋引导" source="故事神谕" status="进行中">',
+        '类型：剧情走向线索，由VOID提供，属于运行规则中的事件资料；不是Participant输入，不拆为U#，不参与输入裁决',
+        `目标方向：${plan.goal}`,
+    ];
+    if (plan.seed) lines.push(`起始迹象：${plan.seed}`);
+    lines.push(
+        '触发与阶段边界：',
+        '- 只在当前地点、人物动机、既有事实与因果允许时推进；先铺垫后兑现，每轮只向目标靠近一步',
+        '- 只安排世界与{{user}}以外人物的言行；不替{{user}}行动、发言或作决定，不预定检定、战斗与生产结果，遇到专用流程入口即停',
+        '- {{user}}的选择优先：偏离此方向时跟随{{user}}，不强行拉回；不为兑现目标违背<虚海规则>，不安排巧遇、馈赠或无理由的让步',
+        '- 本引导只供Recorder规划使用，正文、台词、面板与摘要中都不得提及或暗示它的存在',
+    );
+    if (plan.depiction) {
+        lines.push(
+            '- 这件事不必只在{{user}}在场时发生：{{user}}的行动已把它推动起来后，可以短暂切换视角或用旁白写它在别处发生，也可以让结果经书信、传话或来人找上{{user}}；要让它在正文里真正发生，不停在「即将发生」',
+            '- 时机：只在{{user}}的行动确已促成此事之后才呈现；尚未触发时只做铺垫，不抢先发生、预告或剧透',
+        );
+    }
+    lines.push(directivePaceLine(plan.intensity));
+    lines.push('</event>');
     return lines.join('\n');
 }
 
@@ -19609,7 +19654,9 @@ function applyPlanInjection() {
         ? ctx.extension_prompt_types.IN_CHAT : 1;                    // IN_CHAT
     const role = (ctx.extension_prompt_roles && ctx.extension_prompt_roles.SYSTEM != null)
         ? ctx.extension_prompt_roles.SYSTEM : 0;                     // SYSTEM
-    const depth = Number.isFinite(s.advisorDepth) ? Math.max(0, s.advisorDepth) : 4;
+    let depth = Number.isFinite(s.advisorDepth) ? Math.max(0, s.advisorDepth) : 4;
+    // 🜂 命定适配：兼容模式下引导必须落在 Prime 的「深度2分界」之后（运行规则区）。
+    if (mingdingCompatOn()) depth = Math.min(depth, MINGDING_MAX_DEPTH);
     // Register the ACTIVE construct's injection — an arc's current beat OR a single
     // plan — or clear it with '' when neither exists. The arc beat's text is stored
     // raw and substituted here; a single plan rebuilds via buildDirective (which
@@ -20142,6 +20189,8 @@ function onPromptReadyGlue(data) {
         // 静默放过：不改数组、不写读数（glueLast 只记本趟叙述请求的判决）。
         if (ENABLE_DB_BRIDGE && dbBridgeRun.depth > 0) return false;
         if (!ENABLE_INJECT_GLUE) return glueNote(false, 'flag-off');
+        // 🜂 命定适配：兼容模式下引导留在系统消息里交给 Prime 归位，绝不贴进玩家消息（会变成 <Participant_input>）。
+        if (mingdingCompatOn()) return glueNote(false, 'mingding-compat');
         if (!data || !Array.isArray(data.chat)) return glueNote(false, 'no-chat');
         if (data.dryRun) return glueNote(false, 'dryrun');
         if (!GLUE_GEN_TYPES.includes(glueGen.type)) return glueNote(false, 'type:' + glueGen.type);
@@ -20402,10 +20451,21 @@ const SEQ_PULSE_PROTOCOL = `【序列状态行（系统协议）】
 规则：标签每次只出现一次、贴正文最末；拍与码原样照抄；这行是给引导系统读的锚点，请务必每次输出。
 码一变就是新目标：历史里旧码的状态标签不作数。本次只写到起始迹象或目标的一部分，仍是进行中。`;
 
+// 🜂 命定适配（fork）：Prime 的输出契约要求只有一个 <recorder_output> 根节点、根节点外不得有内容，
+// 但允许 <gametxt> 里放注释。所以状态行改写在 <gametxt> 末行的 HTML 注释里：不显示、不破坏契约，
+// SEQ_PULSE_LINE_RE 照样能在整条回复里找到它（行内不换行即可）。
+const SEQ_PULSE_PROTOCOL_MINGDING = `【序列状态行（运行规则·命定适配）】
+每次回复都在<gametxt>的最后一行（紧挨</gametxt>之前）原样写一行HTML注释形式的状态锚点，报告<event name="剧情参谋引导">中当前目标的落实情况：
+<!-- <so_seq>拍={{BEAT}} 码={{NONCE}} 状态=进行中</so_seq> -->
+仅当该目标已在本次<gametxt>正文中完整发生（不是计划、预告、回忆或对话提及）时，改写为：
+<!-- <so_seq>拍={{BEAT}} 码={{NONCE}} 状态=已达成 证据=「逐字摘自本次<gametxt>正文中能证明它的一句原话」</so_seq> -->
+规则：这行属于<gametxt>允许的注释，不是叙事，不计入字数，也不写进<recorder_thinking>、<recorder_after_format>或</recorder_output>之后；每次只写一行，拍与码原样照抄。
+码一变就是新目标：历史里旧码的状态锚点不作数。本次只写到起始迹象或目标的一部分，仍是进行中。`;
+
 function buildSeqPulsePrompt(seq) {
     const b = seqActiveBeat(seq);
     if (!b || !seq.pulseNonce) return '';
-    return SEQ_PULSE_PROTOCOL.replaceAll('{{BEAT}}', String(b.id)).replaceAll('{{NONCE}}', seq.pulseNonce);
+    return (mingdingCompatOn() ? SEQ_PULSE_PROTOCOL_MINGDING : SEQ_PULSE_PROTOCOL).replaceAll('{{BEAT}}', String(b.id)).replaceAll('{{NONCE}}', seq.pulseNonce);
 }
 
 // 解析：matchAll（不共享 lastIndex——/g 正则跨调用带状态是仓内已知雷）；多行取最后一条合法的。
@@ -20456,7 +20516,8 @@ function seqPulseFragments(quote) {
 // 入选标准 = _piecewise/corpus 里【实证】为写作前的规划 / 审理容器：konatan_planning（step.1 规划）、
 // draft_notes（剧情设计 / 本回合梳理）、logic_check（【审理】【衡平】【天道】三段自查）。
 // 像 <tucao>（写完后的自评吐槽）/ <now_plot> / <writing_style> 这类不是规划容器，有意不收。
-const SEQ_PULSE_PLAN_TAGS = ['konatan_planning', 'draft_notes', 'logic_check'];
+// 🜂 命定适配：Prime 的 <recorder_thinking>（公开裁决表）与 <recorder_after_format>（变量 + 摘要）常复述目标，不算正文证据。
+const SEQ_PULSE_PLAN_TAGS = ['konatan_planning', 'draft_notes', 'logic_check', 'recorder_thinking', 'recorder_after_format'];
 // 断口：剥掉一块后在原处留一个字符，防止两侧文字被接成一段【原回复里没有过】的连续串（那会让
 // grounding 变松）。私用区码位 U+E000——seqPulseNorm 只抹标点 / 符号 / 分隔符 / 空白，它活得下来；
 // 模型的证据里不可能有它，于是任何跨断口的片段必然匹配失败（失败方向 = 更严，符合设计）。
@@ -34569,6 +34630,8 @@ ${ENABLE_THEATER ? `
             <label class="so-field so-adv-field"><span>剧情引导注入深度（方案指令插入主聊天的深度）——模型不听引导时调低，最低 0</span>
                 <input id="so-adv-depth" type="number" step="1" min="0">
             </label>
+            <label class="so-check so-adv-check"><input id="so-adv-mingding" type="checkbox"><span>命定之诗 / Prime 兼容（引导写成 &lt;event&gt; 注入运行规则区，不贴进玩家消息；注入深度自动压到 1 以内）</span></label>
+            <div class="so-hint">配合预设里的「🧩 事件链兼容」一起开。用其它卡、其它预设时取消勾选，恢复原版行为。</div>
             ${ENABLE_SEQ_PULSE ? '<label class="so-check so-adv-check"><input id="so-seq-pulse" type="checkbox"><span>落拍感应（自动提示当前拍可能已完成）</span></label>' : ''}
             ${ENABLE_DB_BRIDGE ? '<label class="so-check so-adv-check"><input id="so-adv-dbbridge" type="checkbox"><span>数据库联动（实验）——装了 SP·数据库 且开着「剧情推进」时勾上，让它的规划也听当前引导</span></label><div class="so-hint" id="so-adv-dbbridge-hint"></div>' : ''}${ENABLE_DB_BRIDGE && ENABLE_DB_BRIDGE_KEEP ? '<label class="so-check so-adv-check" id="so-adv-dbbridge-strip-row"><input id="so-adv-dbbridge-strip" type="checkbox"><span>发给主模型前剥掉引导块（取消勾选 = 引导留在玩家消息里，主模型也能看到）</span></label>' : ''}${ENABLE_NEXT_BEAT ? '<label class="so-check so-adv-check"><input id="so-adv-nbeat" type="checkbox"><span>下一拍建议——在主聊天最新回复下方给出几条你接下来可以发的话，点一下填进输入框</span></label><div class="so-hint" id="so-adv-nbeat-hint"></div><details class="so-adv-nbeat-more" id="so-adv-nbeat-more"><summary>下一拍建议 · 更多设置</summary><div class="so-adv-nbeat-body"><label class="so-check so-adv-check"><input id="so-adv-nbeat-auto" type="checkbox"><span>每条新回复自动生成（每条回复多花一次 API 调用；不勾 = 点卡片上的「生成建议」才生成）</span></label><label class="so-field so-adv-field"><span>喂给它的最新回复最多截取多少字（100–20000，默认 4000）</span><input id="so-adv-nbeat-chars" type="number" step="100" min="100" max="20000"></label><label class="so-field so-adv-field"><span>选项写法（附在请求里的额外要求；清空 = 不附）</span><textarea id="so-adv-nbeat-tpl" rows="8"></textarea></label><div class="so-adv-nbeat-btns"><button type="button" class="so-plan-mini" id="so-adv-nbeat-tpl-reset">↺ 恢复默认</button><button type="button" class="so-plan-mini" id="so-adv-nbeat-tpl-clear">✕ 清空</button></div></div></details>' : ''}
             <button type="button" class="so-plan-mini" id="so-arc-new" title="实验性功能：把整条剧情弧线交给神谕做长程引导（仍在打磨）" style="display:none"><i class="fa-solid fa-route"></i> 新建弧线（手动·实验性）</button>
@@ -35243,6 +35306,9 @@ function bindControls() {
     // After bind() has written the new depth, re-register the active injection —
     // otherwise the setting silently applies only on the next chat switch.
     win.querySelector('#so-adv-depth').addEventListener('input', () => applyPlanInjection());
+    // 🜂 命定适配：切换兼容模式后立刻重登记引导（文本格式、深度、落拍协议都随之变）。
+    bind('#so-adv-mingding', 'mingdingCompat');
+    win.querySelector('#so-adv-mingding').addEventListener('change', () => { applyPlanInjection(); renderPlanBar(); });
     if (ENABLE_SEQ_PULSE) {
         bind('#so-seq-pulse', 'seqPulse');
         win.querySelector('#so-seq-pulse').addEventListener('change', () => {
@@ -35718,6 +35784,7 @@ function loadSettingsIntoForm() {
     win.querySelector('#so-maxtok').value = s.maxTokens;
     win.querySelector('#so-depth').value = s.contextDepth;
     win.querySelector('#so-adv-depth').value = s.advisorDepth;
+    win.querySelector('#so-adv-mingding').checked = s.mingdingCompat !== false;
     if (ENABLE_SEQ_PULSE) win.querySelector('#so-seq-pulse').checked = s.seqPulse !== false;
     if (ENABLE_DB_BRIDGE) {
         win.querySelector('#so-adv-dbbridge').checked = !!s.dbBridge;
@@ -42327,7 +42394,8 @@ function stripMechanismBlocks(text) {
 // 它们会原样显示在气泡里；用户的「清理思维链」正则往往是按某一个预设调的，常常漏网。
 // 所以这里做一道内置兜底，用在普通 / 参谋模式的回复上（显示 + 历史两头都剥）。诊断 /
 // 世界书模式不走这里（它们各自带 <UpdateVariable> / <LorebookEdit> 区块，需原样保留）。
-const REASONING_TAGS = ['think', 'thinking', 'thought', 'reasoning', 'reflection', 'cot'];
+// 🜂 命定适配：Prime 预设的 <recorder_thinking> 也是思维链——神谕读主聊天当上下文时一并剥掉，省 token、不被裁决表带偏。
+const REASONING_TAGS = ['think', 'thinking', 'thought', 'reasoning', 'reflection', 'cot', 'recorder_thinking'];
 
 function stripReasoningTags(text) {
     let out = String(text || '');
