@@ -2078,7 +2078,7 @@ const ENABLE_CUSTOM_PERSONAS = true;
 // —— 更新提醒（1.38.0）——
 // SO_VERSION 是代码内唯一版本号，必须与 manifest.json 的 version 完全一致——update-check.test.mjs
 // 有失配即红的漂移钉（发版清单：两处一起 bump）。
-const SO_VERSION = '2.0.1-mingding.1';
+const SO_VERSION = '2.0.1-mingding.2';
 // 更新提醒总开关。false → 设置面板不渲染「更新」组、开窗不检查、红点绘制器与一键更新 no-op、
 // 绑定/回填跳过——字节级零行为变化。运行期另有 opt-out 设置 updAutoCheck（默认开）。
 // 命定适配版：关掉上游更新提醒——上游的「立即更新」会用原版覆盖本 fork 的改动。
@@ -20917,7 +20917,9 @@ function nbeatTargetIndex(chat) {
 // 回复正文的叙述部分：剥落拍状态行（so_seq）、MVU 更新块、思维链。指纹与提示词共用这一口径——
 // 自动诊断事后往楼里写回更新块不算「正文变了」，候选不因此作废。
 function nbeatCleanReply(text) {
-    const t = String(text ?? '').replace(SEQ_PULSE_LINE_RE, '');
+    let t = String(text ?? '').replace(SEQ_PULSE_LINE_RE, '');
+    // 🜂 命定适配：先抽叙事，免得截取的末尾 N 字被任务卡样式和变量块占掉。
+    if (mingdingCompatOn()) t = mingdingNarrativeText(t, false);
     return stripReasoningTags(stripMechanismBlocks(t)).trim();
 }
 // 截取正文【末尾】max 字（接续从末尾出发，开头最不要紧）。
@@ -23236,9 +23238,25 @@ function listTopLevelTagNames(text) {
 // 已知【正文包裹】标签名（大小写不敏感）——命中即高置信（名字本身就是强信号）。小写常量以避开元测试「ALL_CAPS 须引用≥2次」规则。
 const scopeKnownNames = new Set(['content', 'gametxt', '正文', 'story', 'text', 'narration', 'main', 'reply', 'msg']);
 // 作用域【内层】里算【结构块】（保留区候选）的已知标签名（大小写不敏感，故存小写）。
-const innerStructuralNames = new Set(['status', 'status_profile', 'item_info', 'char_info', 'options', 'branches', 'details', 'htmlcontent', 'updatevariable', 'img_gen', 'image', 'roll', 'bginfor', 'style', 'cestuff', 'action_info', 'so_seq']);   // action_info：命定之诗类战斗卡的结算面板（1.18.0 语料跑批采纳——此前靠标记密集启发式命中，改已知名后确定性守卫）。image：st-chatu8 类图生扩展的 <image>…</image> 生图提示词块（1.18.6 语料 prince-08 采纳——bare 模式靠 own-line 已守，wrapped 模式需白名单，否则 danbooru tag 被当散文送模型改花；姊妹名 img_gen 早已在册）
+const innerStructuralNames = new Set(['status', 'status_profile', 'item_info', 'char_info', 'options', 'branches', 'details', 'htmlcontent', 'updatevariable', 'img_gen', 'image', 'roll', 'bginfor', 'style', 'cestuff', 'action_info', 'so_seq', 'task_info', 'scene_info', 'dalian_chant']);   // action_info：命定之诗类战斗卡的结算面板（1.18.0 语料跑批采纳——此前靠标记密集启发式命中，改已知名后确定性守卫）。image：st-chatu8 类图生扩展的 <image>…</image> 生图提示词块（1.18.6 语料 prince-08 采纳——bare 模式靠 own-line 已守，wrapped 模式需白名单，否则 danbooru tag 被当散文送模型改花；姊妹名 img_gen 早已在册）
 // 「有意义的正文」阈值（字）——低于它视作结构化 / 空块（noWrapper 据此判定）。
 const scopeProseMin = 20;
+
+// 🜂 命定适配（fork）：Prime 把整条回复包在 <recorder_output> 里，正文 <gametxt> 在 <recorder_body> 下面第三层。
+// 只看顶层会把 recorder_output 整个认成正文（裁决表、摘要、任务卡都会被送去改写）。这两个纯容器不作候选，
+// 改为展开其内层继续找；<recorder_thinking> / <recorder_after_format> 也不作候选（裁决表与变量摘要不是正文）。
+const scopeContainerNames = new Set(['recorder_output', 'recorder_body']);
+const scopeNeverNames = new Set(['recorder_thinking', 'recorder_after_format']);
+function scopeCandidateBlocks(text, depth = 0) {
+    const out = [];
+    for (const b of scanTopLevelBlocks(text)) {
+        const lower = b.name.toLowerCase();
+        if (!b.selfClose && !b.bracket && scopeContainerNames.has(lower) && depth < 3) { out.push(...scopeCandidateBlocks(b.inner, depth + 1)); continue; }
+        if (scopeNeverNames.has(lower)) continue;
+        out.push(b);
+    }
+    return out;
+}
 
 // 纯函数：给最近 ~5 条 AI 回复，嗅探卡片把正文包在哪个【作用域标签】里。
 // 每条回复找顶层配平块，算其【剥除嵌套标记后】的正文字数；跨回复按标签名累加（共识——一次性块被稀释）。
@@ -23250,7 +23268,7 @@ function detectScopeTag(replies) {
     if (!list.length) return { tag: '', bracket: false, confidence: 'none', candidates: [], noWrapper: true };
     const agg = new Map();   // lower → { tag, proseChars, known, bracket }
     for (const reply of list) {
-        for (const b of scanTopLevelBlocks(reply)) {
+        for (const b of scopeCandidateBlocks(reply)) {
             if (b.selfClose) continue;                          // 自闭合标记无正文，不作包裹候选
             const lower = b.name.toLowerCase();
             const prose = strippedProseChars(b.inner);
@@ -42351,7 +42369,9 @@ function buildTranscriptTurns(ctx, s, keepMechanism = diagnoseMode) {
             // 基线，就会自信地推算出离谱数值。除诊断模式外（读这些区块正是诊
             // 断的本职），一律从喂给神谕的剧情记录里剥掉。整条消息只剩区块时
             // 会变成空串，被下方的过滤器自然丢弃。
-            text: keepMechanism ? text : stripMechanismBlocks(text),
+            text: (!m.is_user && mingdingCompatOn())
+                ? mingdingNarrativeText(text, keepMechanism)   // 🜂 命定适配：只给叙事（诊断时附 UpdateVariable）
+                : (keepMechanism ? text : stripMechanismBlocks(text)),
         };
     });
 
@@ -42375,6 +42395,39 @@ function buildTranscript(ctx, s, keepMechanism) {
 // v1.40.2 起跨方言（MVU_BLOCK_DIALECTS）：卡片用 <update>/<json_patch> 这类自定义标签时，旧实现漏剥 →
 // 那些增量片段原样泄进普通 / 参谋的提示词，正是本函数要防的事。inner 门在【原文】上判一次（剥完块之后
 // 内层标签就没了，届时再判会漏掉截断尾巴）。
+// 🜂 命定适配（fork）：Prime 预设的 AI 楼层 = <recorder_output>{裁决表 + <recorder_body>{<tp> + <gametxt>} + 变量/摘要}。
+// 神谕拿主聊天当上下文时只需要叙事：取 <tp>（时间地点）与 <gametxt> 正文，丢掉裁决表、面板样式、HTML 注释
+// （数据单 / 落拍锚点）、战斗与角色数值面板；物品 / 任务卡片去掉标记后保留文字。妲丽安的对白标签换成「妲丽安：」。
+// keepMechanism（诊断模式）时把 <UpdateVariable> 原样接在后面——诊断要对照的正是正文与这块更新。
+// 不像 Prime 楼层（没有 <gametxt>）的消息原样返回，所以其它卡不受影响。
+function mingdingNarrativeText(text, keepMechanism) {
+    const raw = String(text == null ? '' : text);
+    const g = raw.match(/<gametxt\b[^>]*>([\s\S]*?)(?:<\/gametxt\s*>|$)/i);
+    if (!g) return raw;
+    const tp = raw.match(/<tp\b[^>]*>([\s\S]*?)<\/tp\s*>/i);
+    let body = g[1]
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, '')
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '')
+        .replace(/<(action_info|char_info)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '')
+        .replace(/<dalian\b[^>]*\bname="([^"]*)"[^>]*>/gi, '$1：')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/(div|p|li|tr|h[1-6])\s*>/gi, '\n')
+        .replace(/<[^>\n]+>/g, '')
+        .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+        .replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    const parts = [];
+    if (tp && tp[1].trim()) parts.push('〔' + tp[1].trim() + '〕');
+    if (body) parts.push(body);
+    if (keepMechanism) {
+        for (const d of MVU_BLOCK_DIALECTS) {
+            const ms = raw.match(mvuBlockRegex(d.wrapper, 'gi'));
+            if (ms) parts.push(...ms);
+        }
+    }
+    return parts.join('\n');
+}
+
 function stripMechanismBlocks(text) {
     let out = String(text || '');
     // 🎭 小剧场 plan 4：主聊天里贴的自动场景快照（记号对 + 中间的一切）先剥——SO 自己的提示词也不带它；先剥，文档里的字就碰不到下面的 MVU 规则。旗关 = 原样。
