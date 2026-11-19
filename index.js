@@ -2078,7 +2078,7 @@ const ENABLE_CUSTOM_PERSONAS = true;
 // —— 更新提醒（1.38.0）——
 // SO_VERSION 是代码内唯一版本号，必须与 manifest.json 的 version 完全一致——update-check.test.mjs
 // 有失配即红的漂移钉（发版清单：两处一起 bump）。
-const SO_VERSION = '2.0.1-mingding.2';
+const SO_VERSION = '2.0.1-mingding.3';
 // 更新提醒总开关。false → 设置面板不渲染「更新」组、开窗不检查、红点绘制器与一键更新 no-op、
 // 绑定/回填跳过——字节级零行为变化。运行期另有 opt-out 设置 updAutoCheck（默认开）。
 // 命定适配版：关掉上游更新提醒——上游的「立即更新」会用原版覆盖本 fork 的改动。
@@ -12940,6 +12940,7 @@ const defaults = {
     //     落拍状态行改为写在 <gametxt> 末行的 HTML 注释里，不破坏 <recorder_output> 的输出契约。
     // 关：与上游 2.0.1 行为一致。
     mingdingCompat: true,
+    advisorEdits: true,   // 🜂 命定适配：参谋可按要求给出变量补丁 / 正文改写稿（用户点按钮才写入）
     // 🧭 数据库联动（1.78.0，ENABLE_DB_BRIDGE）：默认关——只有装了 SP·数据库 且开着「剧情推进」的人才需要勾。
     dbBridge: false,
     // Whether the bridge strips the guidance block back out before the main model sees the user message.
@@ -13072,6 +13073,7 @@ let fixTplDirtyFor = '';
 let fixAutoPromptVersion = 'light';    // ✨ 自动校正提示词选择器（captureFixContext 经 resolveFixModeCfg 设，仅自动有意义）：'thorough' → buildFixPrompt 用精校提示（resolveFixAutoPrompt）；'light' → 轻校（现行）
 let fixAutoPromptFlavor = 'deepseek';  // ✨ 精校侧重：'opus' → FIX_PROMPT_JINGXIAO_OPUS，否则 FIX_PROMPT_JINGXIAO_DEEPSEEK
 let advStatData = '';       // stringified current MVU stat_data for advisor sends
+let advEditCapture = null;  // 🜂 参谋直接修改：本次参谋调用看到的最新一楼（改写稿的底稿 + 陈旧守卫快照）；null = 这次没发原文
                             // (computed fresh in generateReply, '' when no MVU)
 let chatStatData = '';      // same, for NORMAL mode (gated by s.chatIncludeStat)
 let chatWorldData = '';     // 外部扩展（世界引擎等）世界信息，普通 / 参谋模式附带（gated by s.chatIncludeWorld）
@@ -16593,6 +16595,41 @@ function mingdingCompatOn() {
 // Prime 预设的「深度2分界」标记本身注入在深度 2；引导放在深度 ≤1 才能确定落在分界之后，
 // 被 Prime 后处理收进 <VOID_runtime> 的运行规则区（深度 3~900 会进参考区）。
 const MINGDING_MAX_DEPTH = 1;
+
+// 🜂 参谋直接修改（fork）：参谋回复里可带 <UpdateVariable>（变量补丁，走诊断的「应用到状态」+ 撤销）
+// 与 <StoryRewrite>（最新一楼正文改写稿，走校正的「应用到回复」= 新 swipe，MVU 状态整盘拷贝、不重算）。
+// 都只在用户明确要求时出现，都要用户点按钮才写入。最新一楼原文只在用户这句话像是要改正文时才发给参谋（省钱）。
+function advisorEditsOn() {
+    try { return getSettings().advisorEdits !== false; } catch (e) { return true; }
+}
+const ADV_REWRITE_RE = /<StoryRewrite\s*>([\s\S]*?)(?:<\/StoryRewrite\s*>|$)/i;
+const ADV_REWRITE_ASK_RE = /正文|原文|改写|重写|重做|润色|这一?楼|上一楼|最新一楼|这段|那段|这句|那句|回复里|删掉|删去|补写|补一段|加一段|改一下/;
+function parseAdvRewrite(text) {
+    const m = ADV_REWRITE_RE.exec(String(text == null ? '' : text));
+    if (!m) return '';
+    return m[1].replace(/^\s*\n/, '').replace(/\s+$/, '');
+}
+const ADVISOR_EDIT_SECTION = `=== 直接修改主聊天（只在用户明确要求时使用）===
+除了出方案，你还可以按用户的要求直接修改主聊天。你只负责写出改动，系统会在你的回复下方给出「应用」按钮，用户确认后才写入；用户只是讨论、提问或要方案时，不要输出下面任何区块。每种区块一次回复最多一个，区块之前先用一两句话说明改了什么。
+
+1. 改变量（数值、物品、任务、关系、位置等）：在回复末尾输出
+<UpdateVariable>
+<JSONPatch>
+[{"op":"replace","path":"/路径/字段","value":新值}]
+</JSONPatch>
+</UpdateVariable>
+- 路径从上方「当前变量状态」的根写起，只改其中已有的字段；新增条目用 insert，删除用 remove，数值加减用 delta（值是裸数字）。不要使用 null。
+- 只写用户要求的改动，以及为了前后自洽必须连带的改动（连带了什么要在说明里讲清楚）。不要顺手改别的。
+
+2. 改正文（改写、删改、补写主聊天最新一楼）：输出
+<StoryRewrite>
+改完之后的整段正文
+</StoryRewrite>
+- 以下方「主聊天最新一楼正文」为底稿，输出改完后的【完整】正文，不是只给改动的句子；用户没要求改的部分逐字保留。
+- 形如 ⟦SO_KEEP_数字⟧ 的标记是系统暂时抽走的面板和注释，必须原样留在原来的位置。
+- 保持底稿原有的格式与标签写法（例如对白标签），不要加标题、说明或代码围栏。
+- 下方没有给出最新一楼正文时，不要凭对话记录凭空重写，请用户在要求里写明「改正文」之类的字样再说一次。
+- 正文改了、变量也该跟着变时，可以同时给出变量区块。`;
 const SEQ_PULSE_PROMPT_KEY = MODULE + '_seqPulse';
 const ADVISOR_REMIND_AFTER = 20;   // 主聊天走过这么多条消息后，提醒一次方案仍在引导
 const PLAN_META_KEY = MODULE + '_plan';
@@ -34650,6 +34687,8 @@ ${ENABLE_THEATER ? `
             </label>
             <label class="so-check so-adv-check"><input id="so-adv-mingding" type="checkbox"><span>命定之诗 / Prime 兼容（引导写成 &lt;event&gt; 注入运行规则区，不贴进玩家消息；注入深度自动压到 1 以内）</span></label>
             <div class="so-hint">配合预设里的「🧩 事件链兼容」一起开。用其它卡、其它预设时取消勾选，恢复原版行为。</div>
+            <label class="so-check so-adv-check"><input id="so-adv-edits" type="checkbox"><span>允许参谋直接改变量和最新一楼正文（你明确要求时它才给，点「应用」才写入）</span></label>
+            <div class="so-hint">改变量：直接说「把乔安娜好感改成 40」「给我加一把钥匙」。改正文：要求里带上「改正文」「重写这一楼」「这段」之类的字样，它才会拿到最新一楼原文（不带就不发，省钱）。正文改写写成新的一页 swipe，左滑可回原文。</div>
             ${ENABLE_SEQ_PULSE ? '<label class="so-check so-adv-check"><input id="so-seq-pulse" type="checkbox"><span>落拍感应（自动提示当前拍可能已完成）</span></label>' : ''}
             ${ENABLE_DB_BRIDGE ? '<label class="so-check so-adv-check"><input id="so-adv-dbbridge" type="checkbox"><span>数据库联动（实验）——装了 SP·数据库 且开着「剧情推进」时勾上，让它的规划也听当前引导</span></label><div class="so-hint" id="so-adv-dbbridge-hint"></div>' : ''}${ENABLE_DB_BRIDGE && ENABLE_DB_BRIDGE_KEEP ? '<label class="so-check so-adv-check" id="so-adv-dbbridge-strip-row"><input id="so-adv-dbbridge-strip" type="checkbox"><span>发给主模型前剥掉引导块（取消勾选 = 引导留在玩家消息里，主模型也能看到）</span></label>' : ''}${ENABLE_NEXT_BEAT ? '<label class="so-check so-adv-check"><input id="so-adv-nbeat" type="checkbox"><span>下一拍建议——在主聊天最新回复下方给出几条你接下来可以发的话，点一下填进输入框</span></label><div class="so-hint" id="so-adv-nbeat-hint"></div><details class="so-adv-nbeat-more" id="so-adv-nbeat-more"><summary>下一拍建议 · 更多设置</summary><div class="so-adv-nbeat-body"><label class="so-check so-adv-check"><input id="so-adv-nbeat-auto" type="checkbox"><span>每条新回复自动生成（每条回复多花一次 API 调用；不勾 = 点卡片上的「生成建议」才生成）</span></label><label class="so-field so-adv-field"><span>喂给它的最新回复最多截取多少字（100–20000，默认 4000）</span><input id="so-adv-nbeat-chars" type="number" step="100" min="100" max="20000"></label><label class="so-field so-adv-field"><span>选项写法（附在请求里的额外要求；清空 = 不附）</span><textarea id="so-adv-nbeat-tpl" rows="8"></textarea></label><div class="so-adv-nbeat-btns"><button type="button" class="so-plan-mini" id="so-adv-nbeat-tpl-reset">↺ 恢复默认</button><button type="button" class="so-plan-mini" id="so-adv-nbeat-tpl-clear">✕ 清空</button></div></div></details>' : ''}
             <button type="button" class="so-plan-mini" id="so-arc-new" title="实验性功能：把整条剧情弧线交给神谕做长程引导（仍在打磨）" style="display:none"><i class="fa-solid fa-route"></i> 新建弧线（手动·实验性）</button>
@@ -35326,6 +35365,7 @@ function bindControls() {
     win.querySelector('#so-adv-depth').addEventListener('input', () => applyPlanInjection());
     // 🜂 命定适配：切换兼容模式后立刻重登记引导（文本格式、深度、落拍协议都随之变）。
     bind('#so-adv-mingding', 'mingdingCompat');
+    bind('#so-adv-edits', 'advisorEdits');
     win.querySelector('#so-adv-mingding').addEventListener('change', () => { applyPlanInjection(); renderPlanBar(); });
     if (ENABLE_SEQ_PULSE) {
         bind('#so-seq-pulse', 'seqPulse');
@@ -35803,6 +35843,7 @@ function loadSettingsIntoForm() {
     win.querySelector('#so-depth').value = s.contextDepth;
     win.querySelector('#so-adv-depth').value = s.advisorDepth;
     win.querySelector('#so-adv-mingding').checked = s.mingdingCompat !== false;
+    win.querySelector('#so-adv-edits').checked = s.advisorEdits !== false;
     if (ENABLE_SEQ_PULSE) win.querySelector('#so-seq-pulse').checked = s.seqPulse !== false;
     if (ENABLE_DB_BRIDGE) {
         win.querySelector('#so-adv-dbbridge').checked = !!s.dbBridge;
@@ -42240,6 +42281,53 @@ function buildAdvisorSeqBlock(seq, since) {
 // 参谋模式提示词：参谋指令 + 人格（若选）+ 当前引导构件（单拍 异或 弧线，若有，供”检查进度”
 // 用）+ 角色卡 + 世界书 + 【整段】对话记录。无论全局上下文深度设成多少，参谋
 // 都看全史——只看最近十几条提出的方案会漏掉长线伏笔。
+// 🜂 参谋直接修改：抓最新一楼的可改写正文。命定 / Prime 楼层只取 <gametxt> 内层（其余信封原位不动）；
+// 内层里的面板块（task_info / char_info / action_info …）与 HTML 注释（落拍锚点、数据单）换成 ⟦SO_KEEP_n⟧ 占位，
+// 应用时由 composeFixedReply 原位接回。别的卡按校正的作用域检测走；检测不到就整条（去 MVU 块，应用时接回）。
+function advCaptureLatestFloor() {
+    const latest = getLatestAiMessage();
+    if (latest.idx < 0) return null;
+    const full = latest.text;
+    let tag = (mingdingCompatOn() && /<gametxt\b/i.test(full)) ? 'gametxt' : '';
+    if (!tag) {
+        try { const d = detectScopeTag([full]); if (d && d.tag && !d.bracket && d.confidence === 'high') tag = d.tag; } catch (e) { /* 整条 */ }
+    }
+    const scope = tag ? splitContentScope(full, tag) : { active: false };
+    const base = scope.active ? scope.inner : full;
+    const keepStr = detectInnerBlocks(base).map((b) => (b.bracket ? '[' + b.name + ']' : b.name)).join(',');
+    const ex = extractExcludedSections(base, keepStr, '');
+    const keepBlocks = ex.keepBlocks.slice();
+    let prose = scope.active ? ex.prose : stripMechanismBlocks(ex.prose);
+    prose = prose.replace(/<!--[\s\S]*?-->/g, (c) => { const i = keepBlocks.length; keepBlocks.push(c); return fixKeepPlaceholder(i); });
+    // 嵌套占位（如注释里的 <so_seq> 先被当结构块抠走）：把子块原样展开回父块，子槽清空——
+    // 否则 composeFixedReply 按下标顺序还原时找不到子占位，会把子块重复接到末尾。
+    const markRe = new RegExp(FIX_KEEP_MARK + '(\\d+)⟧', 'g');
+    const expand = (txt, depth) => (depth > 8 ? txt : txt.replace(markRe, (all, j) => {
+        const b = keepBlocks[Number(j)];
+        if (typeof b !== 'string') return all;
+        keepBlocks[Number(j)] = '';
+        return expand(b, depth + 1);
+    }));
+    const inProse = new Set([...prose.matchAll(markRe)].map((x) => Number(x[1])));
+    for (const i of inProse) if (typeof keepBlocks[i] === 'string') keepBlocks[i] = expand(keepBlocks[i], 0);
+    const m = (getCtx().chat || [])[latest.idx];
+    return {
+        idx: latest.idx,
+        scope,
+        originalReply: base,
+        keepBlocks,
+        prose: prose.trim(),
+        captured: {
+            chatId: fixChatKey(),
+            targetIdx: latest.idx,
+            swipeId: (m && m.swipe_id) | 0,
+            fingerprint: fixFingerprint(m ? m.mes : ''),
+            prose: prose.trim(),
+            bodyProse: fixBodyProse(full),
+        },
+    };
+}
+
 function buildAdvisorPrompt(ctx, s) {
     const parts = [resolveModePrompt(s, 'advisor')];   // 用户在设置里自定义了就用其覆盖，否则用内置 ADVISOR_SYSTEM_PROMPT
     // 序列引导教学段（1.72.0）：单独一段推，不并进内置正文——自定义过参谋提示词的用户
@@ -42283,6 +42371,13 @@ function buildAdvisorPrompt(ctx, s) {
     // 不显示“不可用”占位——这对参谋是可选情报，不是诊断那样的必需输入。
     if (advStatData) {
         parts.push('=== 当前变量状态（stat_data，来自 MVU —— 剧情推进到此刻的实时数值）===\n' + advStatData);
+    }
+    // 🜂 参谋直接修改：教学段 + （用户像要改正文时）最新一楼底稿。
+    if (advisorEditsOn()) {
+        parts.push(ADVISOR_EDIT_SECTION);
+        if (advEditCapture && advEditCapture.prose) {
+            parts.push('=== 主聊天最新一楼正文（改正文时的底稿）===\n' + advEditCapture.prose);
+        }
     }
 
     // 外部扩展世界信息（世界引擎等）——参谋规划须知道后台正在酝酿的事件 / 势力动向（用户功能请求）。
@@ -42609,6 +42704,17 @@ function splitStoryPlanSegments(text) {
 // 由 parseStoryPlans 从【字符串】解析，与这里的 DOM 渲染无关）。库缺失（无 showdown/DOMPurify）→ 返回 null，
 // 调用方回退纯文本；纯散文回复与普通聊天关正则时同路输出。
 function renderAdvisorReplyHtml(text) {
+    // 🜂 参谋直接修改：<StoryRewrite> 改写稿收进可折叠的原样块，其余照旧渲染。
+    const t = String(text || '');
+    const m = ADV_REWRITE_RE.exec(t);
+    if (!m) return renderAdvisorReplyHtmlCore(t);
+    const before = renderAdvisorReplyHtmlCore(t.slice(0, m.index));
+    const after = renderAdvisorReplyHtmlCore(t.slice(m.index + m[0].length));
+    if (before == null || after == null) return null;
+    return before + '<details class="so-adv-rewrite"><summary>正文改写稿（点开查看；下方「看改动」可对比原文）</summary><pre class="so-plan-raw">'
+        + escapeHtml(m[1].trim()) + '</pre></details>' + after;
+}
+function renderAdvisorReplyHtmlCore(text) {
     const segs = splitStoryPlanSegments(text);
     if (!segs.some((g) => g.type === 'plan')) return renderMarkdownOnly(String(text || ''));
     let html = '';
@@ -43163,6 +43269,13 @@ async function generateReply(options = {}) {
         // proposed beats must not contradict. Silently absent for non-MVU cards.
         const stat = await getMvuStatData();
         advStatData = stat ? JSON.stringify(stat, null, 2) : '';
+        // 🜂 参谋直接修改：变量补丁的陈旧印章按这一份状态算；最新一楼原文只在用户这句像要改正文时才抓。
+        advEditCapture = null;
+        if (advisorEditsOn()) {
+            diagStampKey = diagStatKey(stat);
+            const lastAsk = [...convo].reverse().find((m) => m && m.role === 'user');
+            if (lastAsk && ADV_REWRITE_ASK_RE.test(String(lastAsk.content || ''))) advEditCapture = advCaptureLatestFloor();
+        }
     } else if (fixMode) {
         // 校正模式（手动 / 引导式：在输入框直接说要改什么）：抓待校正回复 + 手动那套上下文（卡 / 世界书 / 概要 / 全部前文）。
         // wholeFloor:true = 整篇手动（思考块保护 W1 只在这条分支生效；✂️ 选段家族同以 mode:'manual' 调用但不传）。
@@ -43446,6 +43559,8 @@ async function generateReply(options = {}) {
                 aEntry = adopted;
                 aEntry.soRxRawMap = rxRawMap;
             }
+            // 🜂 参谋直接修改：改写稿整段留在侧聊历史里会让之后每轮都多带一整楼，存进历史时折叠掉（按钮材料另存在注册表）。
+            if (advisorMode && advisorEditsOn() && ADV_REWRITE_RE.test(historyText)) historyText = historyText.replace(ADV_REWRITE_RE, '<StoryRewrite>（改写稿已省略）</StoryRewrite>');
             aEntry.content = historyText;
             if (ENABLE_ORACLE_REGEX) {   // TBW spec B · B6：模型原文与存下的 content 不同 → 原文另存在旁边（每个版本各一份）；content 不动
                 const rxMap = aEntry.soRxRawMap || null;
@@ -43461,7 +43576,7 @@ async function generateReply(options = {}) {
             // TBW spec A §5.7：重新生成 / 续写之后，只有【最新生成的版本】（且没手改、没删掉过最新版）才钉印章、挂诊断 / 校正应用卡——
             // 在旧版本上 ⏩ 不得给它挂卡，也不得把它的印章写成最新版本那张卡要读的那一枚。新回复（rv 空）= 1.90.0 原样。
             const applyOk = !rv || soApplyAllowedFor(aEntry);
-            const block = (diagnoseMode && applyOk) ? extractUpdateBlock(finalText) : '';
+            const block = ((diagnoseMode || (advisorMode && advisorEditsOn())) && applyOk) ? extractUpdateBlock(finalText) : '';   // 🜂 参谋直接修改：参谋的变量补丁同样钉印章
             if (block) {
                 aEntry.diagStamp = {
                     chatKey: fixChatKey(),
@@ -43508,6 +43623,8 @@ async function generateReply(options = {}) {
                     const seqs = parseStorySequences(cleanText);
                     if (seqs.length) addSeqControls(assistantEl, seqs);
                 }
+                // 🜂 参谋直接修改：变量补丁 / 正文改写稿 → 应用按钮（材料登记进会话注册表，换房重画可重挂）。
+                if (advisorEditsOn() && applyOk) advAttachEdits(assistantEl, aEntry, block, finalText);
             } else if (fixMode) {
                 if (applyOk) {
                     // 失败时 .so-content 已显示剥离机制/思维链后的 cleanText，不覆盖它——只补一条说明 note。
@@ -48116,6 +48233,7 @@ function soRepaintEntry(entry) {
             if ((p.kind === 'diagPatch' || p.kind === 'fixApply') && !soApplyAllowedFor(entry)) continue;
             if (p.kind === 'plans') addPlanControls(el, p.plans);
             else if (p.kind === 'seqs') addSeqControls(el, p.seqs);
+            else if (p.kind === 'advEdit') { if (soApplyAllowedFor(entry)) rehangAdvEdits(el, entry); }
             else if (p.kind === 'lorebook') addLorebookApplyControls(el, p.parsed, entry);
             else if (p.kind === 'diagPatch') {
                 addApplyControls(el, p.block, entry);
@@ -48419,6 +48537,52 @@ async function diagSchemaAfterManualReply(assistantEl, finalText, aEntry, opts) 
 // replyText（可选，第 4 参，1.68.0）= 这条诊断回复的【原文】，供双区块闸看清 MVU 会执行几块
 // （extractUpdateBlock 只摘最早那一个包装块）。换房重画 / 重载后的卡片拿不到原文 → 退化成只数补丁
 // 本身：那仍挡得住「一个包装块里两个区块」这一档，只是「两个包装块」那一档在重画后回到旧行为。
+// 🜂 参谋直接修改：把这条参谋回复里的变量补丁 / 正文改写稿登记进会话注册表并挂按钮。
+// 变量补丁 = 诊断同一条应用路（陈旧印章、修复流水线、撤销都在 addApplyControls 里）；
+// 改写稿 = 校正同一条应用路（fixApply 键，addFixApplyControls 的陈旧守卫 + 新 swipe + 已应用态）。
+function advAttachEdits(assistantEl, entry, block, finalText) {
+    const rw = parseAdvRewrite(finalText);
+    const cap = advEditCapture;
+    const add = {};
+    if (block) add.advPatch = { block, replyText: finalText };
+    if (rw && cap) {
+        add.fixApply = {
+            parsed: { fixed: rw, problems: '' }, originalReply: cap.originalReply, targetIdx: cap.idx,
+            keepSections: cap.keepBlocks, scope: cap.scope, captured: cap.captured, finalOverride: undefined, noteText: '',
+        };
+    }
+    if (!add.advPatch && !add.fixApply) {
+        if (rw && !cap) addSystemNote('参谋给了正文改写稿，但这次没有把最新一楼原文发给它（它是凭记录写的），所以不提供应用按钮。想改正文时，在要求里写明「改正文」「重写这一楼」之类的字样再发一次。');
+        return;
+    }
+    registerNoteOpts(convoStreamKey, entry, Object.assign({}, peekNoteOpts(convoStreamKey, entry) || {}, add));
+    hangAdvEdits(assistantEl, entry, add);
+}
+function rehangAdvEdits(assistantEl, entry) {
+    const o = peekNoteOpts(convoStreamKey, entry);
+    if (!o || (!o.advPatch && !o.fixApply)) return;
+    hangAdvEdits(assistantEl, entry, o);
+}
+function hangAdvEdits(assistantEl, entry, o) {
+    const bubble = assistantEl && assistantEl.querySelector('.so-bubble');
+    if (!bubble) return;
+    if (o.advPatch) {
+        const m = /<JSONPatch\s*>([\s\S]*?)<\/JSONPatch\s*>/i.exec(o.advPatch.block);
+        const d = document.createElement('details');
+        d.className = 'so-adv-patch';
+        d.innerHTML = '<summary>变量改动（点开查看）</summary><pre class="so-plan-raw"></pre>';
+        let shown = m ? m[1].trim() : o.advPatch.block;
+        try { shown = JSON.stringify(JSON.parse(shown), null, 1); } catch (e) { /* 原样 */ }
+        d.querySelector('pre').textContent = shown;
+        bubble.appendChild(d);
+        addApplyControls(assistantEl, o.advPatch.block, entry, o.advPatch.replyText);
+    }
+    if (o.fixApply) {
+        const fa = o.fixApply;
+        addFixApplyControls(assistantEl, fa.parsed, fa.originalReply, fa.targetIdx, fa.keepSections, fa.scope, fa.captured, fa.finalOverride, { entry, applied: !!fa.applied });
+    }
+}
+
 function addApplyControls(assistantEl, patchBlock, entry, replyText) {
     const bar = document.createElement('div');
     bar.className = 'so-apply-bar';
@@ -49382,6 +49546,7 @@ function repaintControlPlan(streamKey, list) {
                 const seqs = parseStorySequences(m.content);
                 if (seqs.length) out.push({ id: m.id, kind: 'seqs', seqs });
             }
+            out.push({ id: m.id, kind: 'advEdit' });   // 🜂 参谋直接修改：材料在注册表里才真挂（rehangAdvEdits 自己判）
         }
     } else if (streamKey === 'lorebook') {
         for (const m of arr) {
@@ -49432,6 +49597,7 @@ function soRehangControlCards(onlyIds) {
         if (ENABLE_REPLY_VERSIONS && (p.kind === 'diagPatch' || p.kind === 'fixApply') && !soApplyAllowedFor(m)) continue;
         if (p.kind === 'plans') addPlanControls(m._el, p.plans);
         else if (p.kind === 'seqs') addSeqControls(m._el, p.seqs);
+        else if (p.kind === 'advEdit') { if (!ENABLE_REPLY_VERSIONS || soApplyAllowedFor(m)) rehangAdvEdits(m._el, m); }
         else if (p.kind === 'lorebook') addLorebookApplyControls(m._el, p.parsed, m);
         else if (p.kind === 'diagPatch') {
             addApplyControls(m._el, p.block, m);
