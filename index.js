@@ -2078,7 +2078,7 @@ const ENABLE_CUSTOM_PERSONAS = true;
 // —— 更新提醒（1.38.0）——
 // SO_VERSION 是代码内唯一版本号，必须与 manifest.json 的 version 完全一致——update-check.test.mjs
 // 有失配即红的漂移钉（发版清单：两处一起 bump）。
-const SO_VERSION = '2.0.1-mingding.3';
+const SO_VERSION = '2.0.1-mingding.4';
 // 更新提醒总开关。false → 设置面板不渲染「更新」组、开窗不检查、红点绘制器与一键更新 no-op、
 // 绑定/回填跳过——字节级零行为变化。运行期另有 opt-out 设置 updAutoCheck（默认开）。
 // 命定适配版：关掉上游更新提醒——上游的「立即更新」会用原版覆盖本 fork 的改动。
@@ -12940,6 +12940,8 @@ const defaults = {
     //     落拍状态行改为写在 <gametxt> 末行的 HTML 注释里，不破坏 <recorder_output> 的输出契约。
     // 关：与上游 2.0.1 行为一致。
     mingdingCompat: true,
+    advisorWiMode: 'follow',   // 🜂 参谋读世界书：follow 跟随全局 | off | st | char | all | custom | smart（先让模型挑相关条目）
+    advisorWiPickMax: 15,      // 🜂 smart 档最多挑几条
     advisorEdits: true,   // 🜂 命定适配：参谋可按要求给出变量补丁 / 正文改写稿（用户点按钮才写入）
     // 🧭 数据库联动（1.78.0，ENABLE_DB_BRIDGE）：默认关——只有装了 SP·数据库 且开着「剧情推进」的人才需要勾。
     dbBridge: false,
@@ -16599,6 +16601,102 @@ const MINGDING_MAX_DEPTH = 1;
 // 🜂 参谋直接修改（fork）：参谋回复里可带 <UpdateVariable>（变量补丁，走诊断的「应用到状态」+ 撤销）
 // 与 <StoryRewrite>（最新一楼正文改写稿，走校正的「应用到回复」= 新 swipe，MVU 状态整盘拷贝、不重算）。
 // 都只在用户明确要求时出现，都要用户点按钮才写入。最新一楼原文只在用户这句话像是要改正文时才发给参谋（省钱）。
+// 🜂 参谋读世界书（fork）：参谋有自己的世界书范围，不再只能跟随全局下拉框（全局默认「关闭」）。
+// smart = 先把角色 / 对话世界书的条目目录（标题 + 关键词 + 正文开头）连同参谋房最近的讨论交给模型，
+// 让它挑出这次设计剧情要参考的条目，再把这些条目的全文给参谋。多一次调用；挑选结果会在参谋房里列出来。
+const ADV_WI_MODES = ['follow', 'off', 'st', 'char', 'all', 'custom', 'smart'];
+function advisorWiModeOf(s) {
+    const m = s && s.advisorWiMode;
+    if (!ADV_WI_MODES.includes(m)) return 'follow';
+    if (m === 'custom' && !ENABLE_WI_CUSTOM_PICK) return 'st';
+    return m;
+}
+function advWiPickMax(s) {
+    const n = Math.round(Number(s && s.advisorWiPickMax));
+    return Number.isFinite(n) ? Math.min(40, Math.max(3, n)) : 15;
+}
+const ADV_WI_PICK_PROMPT = `你是「故事神谕·剧情参谋」的资料员。参谋马上要和用户一起设计剧情（任务、事件、遭遇、人物登场等），你先替它从世界书里挑出这次需要参考的条目。
+下方〔条目目录〕每行一条：编号、灯色、标题、关键词、正文开头。〔参谋房最近的讨论〕里最后一条是用户这次的要求。
+挑选原则：
+- 挑出设计这次剧情真正用得上的设定：涉及的地点、势力、人物、怪物、任务与奖励规则、等级 / 层级 / 经验规则、相关事件等。
+- 规则类条目（例如等级怎么升、经验怎么算、任务怎么发放）只要和这次要求有关就挑上，参谋需要它们保证设计合规。
+- 不要为了凑数挑无关条目；最多挑 {{MAX}} 条，按重要程度从高到低排。
+- 〔上次挑过的〕如果仍然相关可以继续挑。
+只输出一行：
+<AdvisorPick>编号, 编号, 编号</AdvisorPick>
+不要输出别的内容。`;
+let advWiLastPick = null;   // { chatKey, keys: ['书名::uid'] } —— 喂给下一次挑选，保持稳定
+// 纯：解析 <AdvisorPick>，返回编号数组（去重、只留 0..n-1）。
+function parseAdvWiPick(text, n) {
+    const m = /<AdvisorPick\s*>([\s\S]*?)(?:<\/AdvisorPick\s*>|$)/i.exec(String(text || ''));
+    if (!m) return [];
+    const out = [];
+    for (const t of m[1].split(/[^0-9]+/)) {
+        if (!t) continue;
+        const i = Number(t);
+        if (Number.isInteger(i) && i >= 0 && i < n && !out.includes(i)) out.push(i);
+    }
+    return out;
+}
+// 纯：目录。items = [{ book, e }]；lastKeys = Set('书::uid')。
+function buildAdvWiCatalog(items, lastKeys) {
+    const lines = ['〔条目目录〕'];
+    const last = [];
+    items.forEach((it, i) => {
+        const e = it.e;
+        const title = (e.comment && String(e.comment).trim()) || '（无标题）';
+        const keys = Array.isArray(e.key) ? e.key.filter(Boolean).join(',') : '';
+        lines.push(i + ' ' + (e.constant ? '🔵' : '🟢') + ' 《' + it.book + '》「' + title + '」 关键词:' + (keys || '—') + ' 开头: ' + (entryPreviewText(e.content, 50) || '（空）'));
+        if (lastKeys && lastKeys.has(it.book + '::' + e.uid)) last.push(i);
+    });
+    if (last.length) lines.push('', '〔上次挑过的〕' + last.join(', '));
+    return lines.join('\n');
+}
+async function advSmartWorldInfo(s, renderEjs) {
+    const mod = await getWiEditApi();
+    const names = await getCharChatBookNames();
+    if (!mod || !names.length) return '';
+    const items = [];
+    for (const name of names) {
+        let data; try { data = await mod.loadWorldInfo(name); } catch (e) { continue; }
+        Object.values((data && data.entries) || {})
+            .filter((e) => e && !e.disable && typeof e.content === 'string' && e.content.trim() && !isMvuRuleEntry(e))
+            .sort((a, b) => (Number(a.displayIndex ?? a.uid) - Number(b.displayIndex ?? b.uid)))
+            .forEach((e) => items.push({ book: name, e }));
+    }
+    if (!items.length) return '';
+    const chatKey = fixChatKey();
+    const lastKeys = new Set((advWiLastPick && advWiLastPick.chatKey === chatKey) ? advWiLastPick.keys : []);
+    const talk = convo.filter((m) => m && (m.role === 'user' || m.role === 'assistant')).slice(-6)
+        .map((m) => (m.role === 'user' ? '用户：' : '参谋：') + String(m.content || '').slice(0, 800)).join('\n\n');
+    const max = advWiPickMax(s);
+    const messages = [
+        { role: 'system', content: ADV_WI_PICK_PROMPT.replace('{{MAX}}', String(max)) + '\n\n' + buildAdvWiCatalog(items, lastKeys) },
+        { role: 'user', content: '〔参谋房最近的讨论〕\n' + (talk || '（还没有讨论）') + '\n\n请输出 <AdvisorPick>。' },
+    ];
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 90000);
+    let reply = '';
+    try {
+        addSystemNote('📚 正在从世界书挑选相关条目（共 ' + items.length + ' 条可选）…');
+        reply = await soCallModel(messages, { stream: false, maxTokens: 400, signal: ctl.signal });
+    } catch (e) {
+        addSystemNote('📚 挑选世界书条目失败（' + ((e && e.message) || e) + '），这次不带世界书。');
+        return '';
+    } finally { clearTimeout(timer); }
+    const picks = parseAdvWiPick(reply, items.length).slice(0, max);
+    if (!picks.length) { addSystemNote('📚 没有挑出相关条目，这次不带世界书。'); return ''; }
+    advWiLastPick = { chatKey, keys: picks.map((i) => items[i].book + '::' + items[i].e.uid) };
+    const blocks = [];
+    for (const i of picks) {
+        const it = items[i];
+        const body = await renderWiEjs(it.e.content.trim(), it.e, { renderEjs, level: 'entry' });
+        blocks.push('【' + ((it.e.comment && String(it.e.comment).trim()) || ('条目 ' + it.e.uid)) + '】\n' + body);
+    }
+    addSystemNote('📚 这次参考的世界书条目：' + picks.map((i) => '「' + ((items[i].e.comment && String(items[i].e.comment).trim()) || items[i].e.uid) + '」').join('、'));
+    return await stripMvuRuleContents(blocks.join('\n\n'));
+}
+
 function advisorEditsOn() {
     try { return getSettings().advisorEdits !== false; } catch (e) { return true; }
 }
@@ -34687,6 +34785,19 @@ ${ENABLE_THEATER ? `
             </label>
             <label class="so-check so-adv-check"><input id="so-adv-mingding" type="checkbox"><span>命定之诗 / Prime 兼容（引导写成 &lt;event&gt; 注入运行规则区，不贴进玩家消息；注入深度自动压到 1 以内）</span></label>
             <div class="so-hint">配合预设里的「🧩 事件链兼容」一起开。用其它卡、其它预设时取消勾选，恢复原版行为。</div>
+            <label class="so-field so-adv-field"><span>参谋读世界书（设计任务 / 事件时让它参考设定）</span>
+                <select id="so-adv-wi">
+                    <option value="follow">跟随上方全局「世界书」设置</option>
+                    <option value="off">不读</option>
+                    <option value="st">常驻 + 关键词（参谋房里说的话也参与匹配）</option>
+                    <option value="char">仅角色相关世界书（常驻 + 关键词，排除全局）</option>
+                    <option value="smart">让参谋先挑相关条目（每次多一次便宜调用）</option>
+                    ${ENABLE_WI_CUSTOM_PICK ? '<option value="custom">自定义（用全局设置里勾选的条目）</option>' : ''}
+                    <option value="all">全部条目（很贵，大世界书慎用）</option>
+                </select>
+            </label>
+            <label class="so-field so-adv-field" id="so-adv-wi-max-row"><span>「先挑相关条目」最多挑几条（3–40）</span><input id="so-adv-wi-max" type="number" step="1" min="3" max="40"></label>
+            <div class="so-hint">「先挑相关条目」：把角色和对话世界书的条目目录（标题、关键词、开头几十字）连同参谋房最近的讨论发给模型，让它挑出这次要参考的条目，再把这些条目全文给参谋；挑了哪些会在参谋房里列出来。</div>
             <label class="so-check so-adv-check"><input id="so-adv-edits" type="checkbox"><span>允许参谋直接改变量和最新一楼正文（你明确要求时它才给，点「应用」才写入）</span></label>
             <div class="so-hint">改变量：直接说「把乔安娜好感改成 40」「给我加一把钥匙」。改正文：要求里带上「改正文」「重写这一楼」「这段」之类的字样，它才会拿到最新一楼原文（不带就不发，省钱）。正文改写写成新的一页 swipe，左滑可回原文。</div>
             ${ENABLE_SEQ_PULSE ? '<label class="so-check so-adv-check"><input id="so-seq-pulse" type="checkbox"><span>落拍感应（自动提示当前拍可能已完成）</span></label>' : ''}
@@ -35366,6 +35477,17 @@ function bindControls() {
     // 🜂 命定适配：切换兼容模式后立刻重登记引导（文本格式、深度、落拍协议都随之变）。
     bind('#so-adv-mingding', 'mingdingCompat');
     bind('#so-adv-edits', 'advisorEdits');
+    win.querySelector('#so-adv-wi').addEventListener('change', (ev) => {
+        getSettings().advisorWiMode = ev.target.value;
+        save();
+        win.querySelector('#so-adv-wi-max-row').style.display = ev.target.value === 'smart' ? '' : 'none';
+    });
+    win.querySelector('#so-adv-wi-max').addEventListener('change', (ev) => {
+        const v = advWiPickMax({ advisorWiPickMax: ev.target.value });
+        ev.target.value = String(v);
+        getSettings().advisorWiPickMax = v;
+        save();
+    });
     win.querySelector('#so-adv-mingding').addEventListener('change', () => { applyPlanInjection(); renderPlanBar(); });
     if (ENABLE_SEQ_PULSE) {
         bind('#so-seq-pulse', 'seqPulse');
@@ -35844,6 +35966,9 @@ function loadSettingsIntoForm() {
     win.querySelector('#so-adv-depth').value = s.advisorDepth;
     win.querySelector('#so-adv-mingding').checked = s.mingdingCompat !== false;
     win.querySelector('#so-adv-edits').checked = s.advisorEdits !== false;
+    win.querySelector('#so-adv-wi').value = advisorWiModeOf(s);
+    win.querySelector('#so-adv-wi-max').value = String(advWiPickMax(s));
+    win.querySelector('#so-adv-wi-max-row').style.display = advisorWiModeOf(s) === 'smart' ? '' : 'none';
     if (ENABLE_SEQ_PULSE) win.querySelector('#so-seq-pulse').checked = s.seqPulse !== false;
     if (ENABLE_DB_BRIDGE) {
         win.querySelector('#so-adv-dbbridge').checked = !!s.dbBridge;
@@ -43264,7 +43389,12 @@ async function generateReply(options = {}) {
         // 参谋（含弧线系统）现在遵循设置面板的「世界书」选择，包括「关」——不传 forceMode = 用
         // s.worldInfoMode，'off' 返回空串（与普通聊天分支同款）。剧情概要仍在 buildAdvisorPrompt 里默认读取，
         // 对话记录也改为遵循「上下文深度」设置（见 buildAdvisorPrompt）。侧聊最近问答参与绿灯扫描（1.31.0）。
-        worldInfoBlock = await buildWorldInfo(undefined, await sideChatScanBlob(rvScan), { renderEjs: ENABLE_WI_EJS_RENDER && !!s.wiRenderEjs });   // 参谋 = READ 家族，opt-in 时执行世界书 EJS
+        // 🜂 参谋读世界书：参谋自己的范围（follow = 跟随全局下拉框，即原行为）。
+        const advWi = advisorWiModeOf(s);
+        const advEjs = ENABLE_WI_EJS_RENDER && !!s.wiRenderEjs;
+        worldInfoBlock = advWi === 'smart'
+            ? await advSmartWorldInfo(s, advEjs)
+            : await buildWorldInfo(advWi === 'follow' ? undefined : advWi, await sideChatScanBlob(rvScan), { renderEjs: advEjs });   // 参谋 = READ 家族，opt-in 时执行世界书 EJS
         // Live MVU variable state (好感度 / 时间 / 资源…) — hard story facts the
         // proposed beats must not contradict. Silently absent for non-MVU cards.
         const stat = await getMvuStatData();
